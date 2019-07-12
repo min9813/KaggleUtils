@@ -292,3 +292,122 @@ def init_weights(m):
             m.bias.data.fill_(0.01)
     except AttributeError:
         pass
+
+
+NO_TRANSFORM_FEATS = ["feature_1", "feature_2", "feature_3"]
+
+
+def kfold_xdeepfm(train_df, test_df, stratified=False, num_folds=5, debug=False, name="", need_result=False, fold_random_state=42):
+    print("Starting Neural Net. Train shape: {}, test shape: {}".format(
+        train_df.shape, test_df.shape))
+
+    batchsize = 1024
+
+    FOLDs = KFold(n_splits=num_folds, shuffle=True,
+                  random_state=fold_random_state)
+
+    oof_xgb = np.zeros(len(train_df))
+    sub_preds = np.zeros(len(test_df))
+#     feats = [f for f in train_df.columns if f not in FEATS_EXCLUDED]
+    feats = NO_TRANSFORM_FEATS
+
+    params = {
+        "dnn_params": {
+            "layer_num": 3,
+            "n_hidden": (200, 200, 200)
+        },
+        "cin_params": {
+            "layer_num": 3,
+            "hk": (200, 200, 200)
+        },
+        "activation": "lrelu",
+        "embed_dim": 100,
+        "field_num": len(NO_TRANSFORM_FEATS)
+    }
+
+    params["input_size"] = np.sum(
+        [len(train_df[col].unique()) for col in feats])
+    params["out_size"] = 1
+
+    print(params)
+
+    test_prev_max = 0
+    train_prev_max = 0
+    for col in feats:
+        train_df[col] -= train_df[col].min() - train_prev_max
+        test_df[col] -= test_df[col].min() - test_prev_max
+        train_prev_max, test_prev_max = train_df[col].max(), test_df[col].max()
+
+    criterion = nn.MSELoss()
+#     test_pickle_name = "./transformed/simple_test_feats.pickle"
+#     if os.path.exists(test_pickle_name):
+#         with open(test_pickle_name, "rb") as pkl:
+#             test_df[feats] = pickle.load(pkl)
+#     else:
+#         test_df[process_feats] = preprocess_for_nn(test_df[process_feats])
+#         os.mkdir("./transformed")
+#         with open(test_pickle_name, "wb") as pkl:
+#             pickle.dump(test_df[feats], pkl)
+
+    test_iter = DataLoader(torch.LongTensor(
+        test_df[feats].values), batch_size=batchsize, shuffle=False)
+
+    losses = {
+        "train": [],
+        "valid": []
+    }
+
+    cv_score = 0
+    # transformed_folder_path = "./transformed"
+
+    torch.manual_seed(0)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    for fold_, (trn_idx, val_idx) in enumerate(FOLDs.split(train_df[feats], train_df["target"])):
+        trn = train_df[feats+["target"]].iloc[trn_idx]
+        val = train_df[feats+["target"]].iloc[val_idx]
+        print("start train fold {}".format(fold_))
+        net = xdeepfm.xDeepFM(**params).cuda()
+#         net.apply(init_weights)
+        train_iter = DataLoader(torch.FloatTensor(
+            trn.values), batch_size=batchsize, shuffle=True)
+        valid_iter = DataLoader(torch.FloatTensor(
+            val.values), batch_size=batchsize, shuffle=False)
+        optimizer = optim.Adam(net.parameters(), lr=1e-3,
+                               weight_decay=1e-4)
+        net, t_loss, v_loss, outputs, min_val_loss = train_nn(net,
+                                                              criterion=criterion,
+                                                              train_data=train_iter,
+                                                              valid_data=valid_iter,
+                                                              optimizer=optimizer,
+                                                              max_iter=15,
+                                                              params=params)
+        net.cuda()
+
+        oof_xgb[val_idx] = outputs
+        sub_preds += predict(net, test_iter)
+        print("check eval")
+        evaluator(net, criterion, valid_iter)
+
+        score = rmse(val["target"], oof_xgb[val_idx])
+
+        print('no {}-fold loss: {:.6f}'.format(fold_ + 1,
+                                               score))
+        losses["train"].append(t_loss)
+        losses["valid"].append(v_loss)
+
+#         raise NotImplementedError
+
+    sub_preds /= num_folds
+
+    cv_score = np.sqrt(mean_squared_error(oof_xgb, train_df["target"]))
+    print("cross validation score:{:.6f}".format(cv_score))
+
+    subm_path = "./subm_cv={}_xdeepfm".format(cv_score)
+    test_df["target"] = sub_preds
+    if "card_id" not in test_df.columns:
+        test_df = test_df.reset_index()
+    test_df[["card_id", "target"]].to_csv(subm_path, index=False)
+
+    return oof_xgb, sub_preds

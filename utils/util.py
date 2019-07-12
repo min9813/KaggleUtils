@@ -46,6 +46,40 @@ FEATS_EXCLUDED = ['first_active_month', 'target', 'card_id', 'outliers', 'oof_pr
 DATE_BASE = datetime.datetime(2019, 1, 26)
 
 
+import requests
+from contextlib import contextmanager
+
+
+PATH_TO_TOKEN = 'path to token'
+# import sys
+@contextmanager
+def notify_to_line(name):
+    assert ' ' not in PATH_TO_TOKEN
+    start = time.time()
+    
+    try:
+        yield
+        spend = time.time() -start
+        
+        message =  '{} - Done in {:.0f}s !'.format(name, spend)
+    except Exception as e:
+        message = "Error Occured!!"
+        message += f"\nType:{str(type(e))}"
+        message += f"\nMessage:{e}"
+        sys.stdout.write(message)
+        sys.stdout.flush()
+        spend = time.time() -start
+        
+    url = "https://notify-api.line.me/api/notify"
+    with open(PATH_TO_TOKEN, "r") as f:
+        token = f.read().strip()
+    headers = {"Authorization" : "Bearer "+ token}
+    payload = {"message" :  message}
+#     files = {"imageFile": open("end.jpg", "rb")}
+
+    r = requests.post(url ,headers = headers ,params=payload)
+
+
 @contextmanager
 def timer(title):
     t0 = time.time()
@@ -1312,3 +1346,73 @@ def save_status_intermediate(train_df, test_df, prediction, clfs, clf_name, fold
 #         pickle.dump(clfs,pkl)
 
     return folder_name, test_df[['card_id', feature_name]]
+
+def kfold_sklearn(train_df, test_df, num_folds, clf, stratified = False, debug= False, name="", need_result=False, fold_random_state=42):
+
+    print("Starting LightGBM. Train shape: {}, test shape: {}".format(train_df.shape, test_df.shape))
+
+    # Cross validation model
+    if stratified:
+        folds = StratifiedKFold(n_splits= num_folds, shuffle=True, random_state=fold_random_state)
+    else:
+        folds = KFold(n_splits= num_folds, shuffle=True, random_state=fold_random_state)
+
+    # Create arrays and dataframes to store results
+    oof_preds = np.zeros(train_df.shape[0])
+    sub_preds = np.zeros(test_df.shape[0])
+    folder_name = "nn_subm_cv_normed/"
+    test_pickle_name = f"{folder_name}/test_feats.pickle"
+    if os.path.exists(test_pickle_name):
+        with open(test_pickle_name, "rb") as pkl:
+            test_df[feats] = pickle.load(pkl)
+    else:
+        test_df[feats] = preprocess_for_nn(test_df[feats])
+        if os.path.exists(folder_name) is False:
+            os.mkdir(folder_name)
+        with open(test_pickle_name, "wb") as pkl:
+            pickle.dump(test_df[feats], pkl)
+    clfs = []
+    # k-fold
+    cv_score = 0
+    transformed_folder_path = "./transformed_normed"
+    if os.path.exists(transformed_folder_path) is False:
+        os.mkdir(transformed_folder_path)
+    for n_fold, (train_idx, valid_idx) in enumerate(folds.split(train_df[feats], train_df['target'])):
+        train_path = os.path.join(transformed_folder_path, "trn_total{}_fold:{}.csv".format(num_folds, n_fold+1))
+        valid_path = os.path.join(transformed_folder_path, "val_total{}_fold:{}.csv".format(num_folds, n_fold+1))
+        
+        flag_data = os.path.exists(train_path)
+        if flag_data:
+            print("load file from pickle ...")
+            with open(train_path, "rb") as pkl:
+                trn = pickle.load(pkl)
+            with open(valid_path, "rb") as pkl:
+                val = pickle.load(pkl)
+            print("finish!")
+        else:
+            print("make transformed data and save it ...")
+            trn = train_df[feats+["target"]].iloc[train_idx]
+            val = train_df[feats+["target"]].iloc[valid_idx]
+            trn[feats], val[feats] = preprocess_for_nn(trn[feats], val[feats])
+            with open(train_path, "wb") as pkl:
+                pickle.dump(trn, pkl)
+            with open(valid_path, "wb") as pkl:
+                pickle.dump(val, pkl)
+            print("finish!")
+        print("start train fold {}".format(n_fold))
+        # set data structure
+#         clf = LGBMRegressor(**params)
+        clf.fit(trn[feats], trn["target"])
+        clfs.append(clf)
+
+        # params optimized by optuna
+
+        oof_preds[valid_idx] = clf.predict(val[feats])
+        sub_preds += clf.predict(test_df[feats]) / folds.n_splits
+
+        score = rmse(val["target"], oof_preds[valid_idx])
+        cv_score += score/folds.n_splits
+        print('Fold %2d RMSE : %.6f' % (n_fold + 1, score))
+        
+        
+    print("total cv score:{:.6f}".format(cv_score))
